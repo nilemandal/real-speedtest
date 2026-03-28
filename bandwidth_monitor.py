@@ -743,7 +743,6 @@ def run_monitor(cfg, db_path):
                         if now - last > 60:
                             msg = f"Low {label} speed: {value:.2f} Mbps (threshold: {threshold} Mbps)"
                             store_alert(conn, msg)
-                            notify("Bandwidth Alert", msg)
                             alert_count += 1
                             alert_cooldown[label] = now
 
