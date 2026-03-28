@@ -163,22 +163,78 @@ class SpeedTestRunner:
         self.running = False
         self.error = None
 
+    # Test files: multiple servers for reliability
+    DOWNLOAD_URLS = [
+        ("https://proof.ovh.net/files/10Mb.dat", "OVH (France)"),
+        ("https://speed.hetzner.de/10MB.bin", "Hetzner (Germany)"),
+    ]
+    UPLOAD_URL = "https://httpbin.org/post"
+
+    def _ping(self, host: str = "8.8.8.8") -> float:
+        """Measure ping to a host in ms."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "3", "-q", host],
+                capture_output=True, text=True, timeout=10,
+            )
+            # Parse avg from "min/avg/max/stddev = ..."
+            for line in result.stdout.splitlines():
+                if "avg" in line:
+                    parts = line.split("=")[-1].strip().split("/")
+                    return float(parts[1])
+        except Exception:
+            pass
+        return 0.0
+
+    def _download_test(self) -> tuple:
+        """Test download speed, returns (mbps, server_name)."""
+        import urllib.request
+        best_mbps = 0.0
+        best_server = None
+        for url, server in self.DOWNLOAD_URLS:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "BandwidthMonitor/1.0"})
+                start = time.monotonic()
+                data = urllib.request.urlopen(req, timeout=20).read()
+                elapsed = time.monotonic() - start
+                mbps = (len(data) * 8) / (elapsed * 1_000_000)
+                if mbps > best_mbps:
+                    best_mbps = mbps
+                    best_server = server
+            except Exception:
+                continue
+        return best_mbps, best_server
+
+    def _upload_test(self) -> float:
+        """Test upload speed by POSTing data, returns mbps."""
+        import urllib.request
+        try:
+            payload = b"0" * 2_000_000  # 2 MB
+            req = urllib.request.Request(
+                self.UPLOAD_URL,
+                data=payload,
+                headers={"User-Agent": "BandwidthMonitor/1.0", "Content-Type": "application/octet-stream"},
+            )
+            start = time.monotonic()
+            urllib.request.urlopen(req, timeout=30)
+            elapsed = time.monotonic() - start
+            return (len(payload) * 8) / (elapsed * 1_000_000)
+        except Exception:
+            return 0.0
+
     def run(self):
         """Run a real internet speed test (blocking, ~30s)."""
         self.running = True
         self.error = None
         try:
-            import speedtest
-            st = speedtest.Speedtest()
-            st.get_best_server()
-            st.download()
-            st.upload()
-            results = st.results.dict()
-            self.last_down = results["download"] / 1_000_000  # bps → Mbps
-            self.last_up = results["upload"] / 1_000_000
-            self.last_ping = results["ping"]
-            self.last_server = results["server"]["sponsor"]
-            self.last_time = datetime.now()
+            self.last_ping = self._ping()
+            self.last_down, self.last_server = self._download_test()
+            self.last_up = self._upload_test()
+            if self.last_down == 0 and self.last_up == 0:
+                self.error = "All test servers unreachable"
+            else:
+                self.last_time = datetime.now()
         except Exception as e:
             self.error = str(e)
         finally:
