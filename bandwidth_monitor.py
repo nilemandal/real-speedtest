@@ -151,6 +151,90 @@ class BandwidthSampler:
         self.prev_time = now
 
 
+# ── Per-process bandwidth tracking (macOS nettop) ────────────────────────────
+
+class ProcessBandwidthTracker:
+    """Tracks per-process network usage using macOS nettop command."""
+
+    def __init__(self):
+        self.processes = []  # list of (name, pid, down_mbps, up_mbps)
+        self._lock = threading.Lock()
+
+    def sample(self):
+        """Run nettop for 2 samples (1s delta) and parse per-process bandwidth."""
+        try:
+            result = subprocess.run(
+                ["nettop", "-P", "-L", "2", "-n", "-x", "-d", "-s", "1"],
+                capture_output=True, text=True, timeout=5,
+            )
+            lines = result.stdout.strip().splitlines()
+
+            # Find the second sample block (delta values)
+            second_header = -1
+            header_count = 0
+            for i, line in enumerate(lines):
+                if line.startswith("time,"):
+                    header_count += 1
+                    if header_count == 2:
+                        second_header = i
+                        break
+
+            if second_header == -1:
+                return
+
+            procs = []
+            for line in lines[second_header + 1:]:
+                if line.startswith("time,"):
+                    break
+                parts = line.split(",")
+                if len(parts) < 6:
+                    continue
+
+                name_pid = parts[1].strip()
+                if not name_pid:
+                    continue
+
+                try:
+                    bytes_in = int(parts[4]) if parts[4] else 0
+                    bytes_out = int(parts[5]) if parts[5] else 0
+                except (ValueError, IndexError):
+                    continue
+
+                if bytes_in == 0 and bytes_out == 0:
+                    continue
+
+                # Parse "ProcessName.PID" format
+                dot_idx = name_pid.rfind(".")
+                if dot_idx > 0:
+                    name = name_pid[:dot_idx]
+                    try:
+                        pid = int(name_pid[dot_idx + 1:])
+                    except ValueError:
+                        name = name_pid
+                        pid = 0
+                else:
+                    name = name_pid
+                    pid = 0
+
+                down_mbps = (bytes_in * 8) / 1_000_000  # per second (1s sample)
+                up_mbps = (bytes_out * 8) / 1_000_000
+
+                procs.append((name, pid, down_mbps, up_mbps))
+
+            # Sort by total bandwidth (download + upload), descending
+            procs.sort(key=lambda x: x[2] + x[3], reverse=True)
+
+            with self._lock:
+                self.processes = procs[:15]  # top 15
+
+        except Exception:
+            pass
+
+    def get_processes(self):
+        with self._lock:
+            return list(self.processes)
+
+
 # ── Speed test runner ─────────────────────────────────────────────────────────
 
 class SpeedTestRunner:
@@ -341,11 +425,12 @@ def speed_bar(mbps: float, max_mbps: float = 100.0, width: int = 30) -> Text:
     return bar
 
 
-def build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start) -> Layout:
+def build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start, proc_tracker=None) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="body"),
+        Layout(name="top_row", size=10),
+        Layout(name="processes"),
         Layout(name="footer", size=5),
     )
 
@@ -358,19 +443,19 @@ def build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start) 
         )
     )
 
-    # Body — live speeds + speedtest
-    body = Layout()
-    body.split_row(Layout(name="live", ratio=1), Layout(name="speedtest", ratio=1))
+    # Top row — live speeds + speedtest
+    top_row = Layout()
+    top_row.split_row(Layout(name="live", ratio=1), Layout(name="speedtest", ratio=1))
 
     # Live panel
     live_table = Table.grid(padding=(1, 2))
     live_table.add_row(Text("▼ Download", style="bold green"), speed_bar(sampler.down_mbps))
     live_table.add_row(Text("▲ Upload", style="bold blue"), speed_bar(sampler.up_mbps))
-    body["live"].update(Panel(live_table, title="[bold]Real-time Interface Speed[/bold]", border_style="green"))
+    top_row["live"].update(Panel(live_table, title="[bold]Real-time Interface Speed[/bold]", border_style="green"))
 
     # Speedtest panel
     if speedtest_runner.running:
-        st_content = Text("  Running speed test... ⏳", style="yellow italic")
+        st_content = Text("  Running speed test...", style="yellow italic")
     elif speedtest_runner.error:
         st_content = Text(f"  Error: {speedtest_runner.error}", style="red")
     elif speedtest_runner.last_time:
@@ -383,9 +468,35 @@ def build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start) 
         st_content = st_table
     else:
         st_content = Text("  Waiting for first test...", style="dim")
-    body["speedtest"].update(Panel(st_content, title="[bold]Internet Speed Test[/bold]", border_style="cyan"))
+    top_row["speedtest"].update(Panel(st_content, title="[bold]Internet Speed Test[/bold]", border_style="cyan"))
 
-    layout["body"].update(body)
+    layout["top_row"].update(top_row)
+
+    # Per-process bandwidth table
+    proc_table = Table(expand=True, pad_edge=True)
+    proc_table.add_column("#", style="dim", width=3)
+    proc_table.add_column("Application", style="cyan", ratio=3)
+    proc_table.add_column("PID", style="dim", width=7)
+    proc_table.add_column("Download", style="green", width=14, justify="right")
+    proc_table.add_column("Upload", style="blue", width=14, justify="right")
+    proc_table.add_column("Total", style="yellow", width=14, justify="right")
+
+    if proc_tracker:
+        procs = proc_tracker.get_processes()
+        if procs:
+            for i, (name, pid, down, up) in enumerate(procs[:10], 1):
+                total = down + up
+                pid_str = str(pid) if pid else "-"
+                proc_table.add_row(
+                    str(i), name, pid_str,
+                    f"{down:.2f} Mbps", f"{up:.2f} Mbps", f"{total:.2f} Mbps",
+                )
+        else:
+            proc_table.add_row("-", "No active network processes", "-", "-", "-", "-")
+
+    layout["processes"].update(
+        Panel(proc_table, title="[bold]Apps Using Bandwidth[/bold]", border_style="magenta")
+    )
 
     # Footer
     footer_text = (
@@ -406,10 +517,12 @@ def run_monitor(cfg, db_path):
     conn = init_db(db_path)
     sampler = BandwidthSampler(cfg["interface"])
     speedtest_runner = SpeedTestRunner()
+    proc_tracker = ProcessBandwidthTracker()
     alert_count = 0
     session_start = time.time()
     last_speedtest_time = 0
     last_db_write = 0
+    last_proc_sample = 0
     alert_cooldown = {}  # type → last_alert_time
 
     stop_event = threading.Event()
@@ -438,13 +551,22 @@ def run_monitor(cfg, db_path):
                     )
             stop_event.wait(10)
 
+    def proc_tracker_loop():
+        """Sample per-process bandwidth every 3 seconds in background."""
+        while not stop_event.is_set():
+            proc_tracker.sample()
+            stop_event.wait(3)
+
     st_thread = threading.Thread(target=speedtest_loop, daemon=True)
     st_thread.start()
+
+    pt_thread = threading.Thread(target=proc_tracker_loop, daemon=True)
+    pt_thread.start()
 
     console.print("[bold green]Starting bandwidth monitor...[/bold green] Press Ctrl+C to stop.\n")
 
     try:
-        with Live(build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start),
+        with Live(build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start, proc_tracker),
                    console=console, refresh_per_second=2, screen=True) as live:
             while not stop_event.is_set():
                 sampler.sample()
@@ -469,7 +591,7 @@ def run_monitor(cfg, db_path):
                             alert_count += 1
                             alert_cooldown[label] = now
 
-                live.update(build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start))
+                live.update(build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start, proc_tracker))
                 time.sleep(SAMPLE_INTERVAL_SEC)
     except KeyboardInterrupt:
         pass
