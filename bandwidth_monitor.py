@@ -153,15 +153,133 @@ class BandwidthSampler:
 
 # ── Per-process bandwidth tracking (macOS nettop) ────────────────────────────
 
+# Map nettop short names / helper processes to clean app names
+APP_NAME_MAP = {
+    "Brave Browser H": "Brave Browser",
+    "Brave Browser He": "Brave Browser",
+    "Google Chrome He": "Google Chrome",
+    "Google Chrome H": "Google Chrome",
+    "Firefox Helper": "Firefox",
+    "Safari Networki": "Safari",
+    "Code Helper": "VS Code",
+    "Code Helper (Pl": "VS Code",
+    "Code Helper (Re": "VS Code",
+    "Code Helper (GP": "VS Code",
+    "Electron Helper": "Electron App",
+    "Claude Helper": "Claude",
+    "Claude Helper (": "Claude",
+    "Slack Helper": "Slack",
+    "Slack Helper (R": "Slack",
+    "Discord Helper": "Discord",
+    "Discord Helper ": "Discord",
+    "Spotify Helper": "Spotify",
+    "Spotify Helper ": "Spotify",
+    "Telegram Helper": "Telegram",
+    "WhatsApp Helper": "WhatsApp",
+    "Postman Helper": "Postman",
+    "Postman Helper ": "Postman",
+    "GitHub Desktop ": "GitHub Desktop",
+    "com.docker.back": "Docker",
+    "com.apple.WebKi": "WebKit (Safari)",
+    "apsd": "Apple Push Service",
+    "mDNSResponder": "DNS (Bonjour)",
+    "rapportd": "AirDrop/Handoff",
+    "identityservice": "iCloud Identity",
+    "sharingd": "AirDrop Sharing",
+    "netbiosd": "NetBIOS",
+    "symptomsd": "Network Diagnostics",
+    "nsurlsessiond": "macOS URL Sessions",
+    "cloudd": "iCloud Sync",
+    "bird": "iCloud Drive",
+    "CalendarAgent": "Calendar Sync",
+    "Mail": "Apple Mail",
+    "accountsd": "Account Sync",
+    "parsecd": "Siri/Parsec",
+    "airportd": "Wi-Fi Service",
+    "wifip2pd": "Wi-Fi P2P",
+    "CommCenter": "Cellular/Calls",
+    "assistantd": "Siri",
+    "mediaremoted": "Media Remote",
+    "AMPDeviceDiscov": "Apple Music",
+    "AMPLibraryAgent": "Apple Music",
+    "Music": "Apple Music",
+    "Finder": "Finder",
+    "softwareupdated": "Software Update",
+    "WeatherMenu": "Weather Widget",
+    "replicatord": "Replicator",
+    "mongod": "MongoDB",
+    "mysqld": "MySQL",
+    "postgres": "PostgreSQL",
+    "redis-server": "Redis",
+    "nginx": "Nginx",
+    "httpd": "Apache",
+    "node": "Node.js",
+    "python3": "Python",
+    "python": "Python",
+    "ruby": "Ruby",
+    "java": "Java",
+    "go": "Go",
+    "curl": "curl",
+    "wget": "wget",
+    "ssh": "SSH",
+    "scp": "SCP",
+    "rsync": "rsync",
+    "git-remote-http": "Git",
+    "git": "Git",
+    "stable": "Cursor",
+}
+
+
+def _resolve_app_name(nettop_name: str, pid: int) -> str:
+    """Resolve a clean, full application name from nettop's truncated process name."""
+    # Direct map match
+    if nettop_name in APP_NAME_MAP:
+        return APP_NAME_MAP[nettop_name]
+
+    # Try prefix matching for truncated names
+    for key, val in APP_NAME_MAP.items():
+        if nettop_name.startswith(key) or key.startswith(nettop_name):
+            return val
+
+    # Try psutil for the full process name or parent app
+    if pid > 0:
+        try:
+            proc = psutil.Process(pid)
+            full_name = proc.name()
+            # Check if psutil name maps better
+            if full_name in APP_NAME_MAP:
+                return APP_NAME_MAP[full_name]
+            # For Helper processes, try to get parent app name
+            if "Helper" in full_name or "helper" in full_name:
+                try:
+                    parent = proc.parent()
+                    if parent:
+                        parent_name = parent.name()
+                        if parent_name in APP_NAME_MAP:
+                            return APP_NAME_MAP[parent_name]
+                        if "Helper" not in parent_name:
+                            return parent_name
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            # Use the full name from psutil (better than nettop's truncation)
+            return full_name
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return nettop_name
+
+
 class ProcessBandwidthTracker:
-    """Tracks per-process network usage using macOS nettop command."""
+    """Tracks per-process network usage using macOS nettop command.
+    Groups sub-processes under their parent application and shows clean names.
+    """
 
     def __init__(self):
-        self.processes = []  # list of (name, pid, down_mbps, up_mbps)
+        self.apps = []  # list of dicts: {name, pids, down_mbps, up_mbps, proc_count}
         self._lock = threading.Lock()
 
     def sample(self):
-        """Run nettop for 2 samples (1s delta) and parse per-process bandwidth."""
+        """Run nettop for 2 samples (1s delta), resolve names, group by app."""
         try:
             result = subprocess.run(
                 ["nettop", "-P", "-L", "2", "-n", "-x", "-d", "-s", "1"],
@@ -182,7 +300,8 @@ class ProcessBandwidthTracker:
             if second_header == -1:
                 return
 
-            procs = []
+            # Collect raw per-process data
+            raw_procs = []
             for line in lines[second_header + 1:]:
                 if line.startswith("time,"):
                     break
@@ -206,33 +325,44 @@ class ProcessBandwidthTracker:
                 # Parse "ProcessName.PID" format
                 dot_idx = name_pid.rfind(".")
                 if dot_idx > 0:
-                    name = name_pid[:dot_idx]
+                    nettop_name = name_pid[:dot_idx]
                     try:
                         pid = int(name_pid[dot_idx + 1:])
                     except ValueError:
-                        name = name_pid
+                        nettop_name = name_pid
                         pid = 0
                 else:
-                    name = name_pid
+                    nettop_name = name_pid
                     pid = 0
 
-                down_mbps = (bytes_in * 8) / 1_000_000  # per second (1s sample)
+                down_mbps = (bytes_in * 8) / 1_000_000
                 up_mbps = (bytes_out * 8) / 1_000_000
+                app_name = _resolve_app_name(nettop_name, pid)
 
-                procs.append((name, pid, down_mbps, up_mbps))
+                raw_procs.append((app_name, pid, down_mbps, up_mbps))
 
-            # Sort by total bandwidth (download + upload), descending
-            procs.sort(key=lambda x: x[2] + x[3], reverse=True)
+            # Group by resolved app name
+            grouped = {}
+            for app_name, pid, down, up in raw_procs:
+                if app_name not in grouped:
+                    grouped[app_name] = {"name": app_name, "pids": set(), "down_mbps": 0.0, "up_mbps": 0.0, "proc_count": 0}
+                grouped[app_name]["pids"].add(pid)
+                grouped[app_name]["down_mbps"] += down
+                grouped[app_name]["up_mbps"] += up
+                grouped[app_name]["proc_count"] += 1
+
+            # Sort by total bandwidth descending
+            apps = sorted(grouped.values(), key=lambda x: x["down_mbps"] + x["up_mbps"], reverse=True)
 
             with self._lock:
-                self.processes = procs[:15]  # top 15
+                self.apps = apps[:15]
 
         except Exception:
             pass
 
-    def get_processes(self):
+    def get_apps(self):
         with self._lock:
-            return list(self.processes)
+            return list(self.apps)
 
 
 # ── Speed test runner ─────────────────────────────────────────────────────────
@@ -472,30 +602,56 @@ def build_dashboard(sampler, speedtest_runner, cfg, alert_count, session_start, 
 
     layout["top_row"].update(top_row)
 
-    # Per-process bandwidth table
+    # Per-app bandwidth table (grouped, sorted heaviest first)
     proc_table = Table(expand=True, pad_edge=True)
     proc_table.add_column("#", style="dim", width=3)
     proc_table.add_column("Application", style="cyan", ratio=3)
-    proc_table.add_column("PID", style="dim", width=7)
+    proc_table.add_column("Processes", style="dim", width=9, justify="center")
     proc_table.add_column("Download", style="green", width=14, justify="right")
     proc_table.add_column("Upload", style="blue", width=14, justify="right")
-    proc_table.add_column("Total", style="yellow", width=14, justify="right")
+    proc_table.add_column("Total", style="yellow bold", width=14, justify="right")
+    proc_table.add_column("", width=20)  # mini bar
 
     if proc_tracker:
-        procs = proc_tracker.get_processes()
-        if procs:
-            for i, (name, pid, down, up) in enumerate(procs[:10], 1):
-                total = down + up
-                pid_str = str(pid) if pid else "-"
+        apps = proc_tracker.get_apps()
+        if apps:
+            # Find max total for scaling the mini bar
+            max_total = max((a["down_mbps"] + a["up_mbps"]) for a in apps) if apps else 1
+            for i, app in enumerate(apps[:10], 1):
+                total = app["down_mbps"] + app["up_mbps"]
+                proc_count = str(app["proc_count"]) if app["proc_count"] > 1 else ""
+
+                # Mini usage bar
+                bar_width = 15
+                if max_total > 0:
+                    filled = int((total / max_total) * bar_width)
+                else:
+                    filled = 0
+                if total > 1:
+                    bar_color = "red" if i == 1 and total > 5 else "yellow"
+                else:
+                    bar_color = "green"
+                mini_bar = Text()
+                mini_bar.append("█" * filled, style=bar_color)
+                mini_bar.append("░" * (bar_width - filled), style="dim")
+
+                # Highlight the top bandwidth hog
+                name_style = "bold red" if i == 1 and total > 1 else "cyan"
+
                 proc_table.add_row(
-                    str(i), name, pid_str,
-                    f"{down:.2f} Mbps", f"{up:.2f} Mbps", f"{total:.2f} Mbps",
+                    str(i),
+                    Text(app["name"], style=name_style),
+                    proc_count,
+                    f"{app['down_mbps']:.2f} Mbps",
+                    f"{app['up_mbps']:.2f} Mbps",
+                    f"{total:.2f} Mbps",
+                    mini_bar,
                 )
         else:
-            proc_table.add_row("-", "No active network processes", "-", "-", "-", "-")
+            proc_table.add_row("-", "No active network processes", "-", "-", "-", "-", "")
 
     layout["processes"].update(
-        Panel(proc_table, title="[bold]Apps Using Bandwidth[/bold]", border_style="magenta")
+        Panel(proc_table, title="[bold]Apps Using Bandwidth (grouped, heaviest first)[/bold]", border_style="magenta")
     )
 
     # Footer
